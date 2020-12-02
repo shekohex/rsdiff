@@ -17,7 +17,7 @@
     <img src="https://github.com/shekohex/rsdiff/workflows/Nightly%20lints/badge.svg"
       alt="Lints" />
   </a>
-  <a href="https://shadykhalifa.me/rsdiff">
+  <a href="https://shadykhalifa.me/rsdiff/rsdiff">
     <img src="https://img.shields.io/badge/docs-0.1.0-blue"
       alt="Documentation" />
   </a>
