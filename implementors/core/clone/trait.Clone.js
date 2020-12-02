@@ -1,0 +1,3 @@
+(function() {var implementors = {};
+implementors["rsdiff"] = [{"text":"impl Clone for Operation","synthetic":false,"types":[]},{"text":"impl Clone for Delta","synthetic":false,"types":[]},{"text":"impl Clone for RollingHasher","synthetic":false,"types":[]},{"text":"impl&lt;B:&nbsp;Clone + AsRef&lt;[u8]&gt;&gt; Clone for Signature&lt;B&gt;","synthetic":false,"types":[]},{"text":"impl Clone for IndexedSignature","synthetic":false,"types":[]}];
+if (window.register_implementors) {window.register_implementors(implementors);} else {window.pending_implementors = implementors;}})()

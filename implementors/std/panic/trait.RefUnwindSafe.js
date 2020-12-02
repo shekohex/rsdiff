@@ -1,0 +1,3 @@
+(function() {var implementors = {};
+implementors["rsdiff"] = [{"text":"impl RefUnwindSafe for Delta","synthetic":true,"types":[]},{"text":"impl RefUnwindSafe for IndexedSignature","synthetic":true,"types":[]},{"text":"impl RefUnwindSafe for RollingHasher","synthetic":true,"types":[]},{"text":"impl&lt;B&gt; RefUnwindSafe for Signature&lt;B&gt; <span class=\"where fmt-newline\">where<br>&nbsp;&nbsp;&nbsp;&nbsp;B: RefUnwindSafe,&nbsp;</span>","synthetic":true,"types":[]},{"text":"impl RefUnwindSafe for Operation","synthetic":true,"types":[]}];
+if (window.register_implementors) {window.register_implementors(implementors);} else {window.pending_implementors = implementors;}})()
