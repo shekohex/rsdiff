@@ -1,3 +1,4 @@
+#![deny(unsafe_code)]
 //! ## rsdiff(1).
 //!
 //! A simple implementation of [`rdiff(1)`](https://linux.die.net/man/1/rdiff).
