@@ -7,7 +7,21 @@
   <sup>not really a rdiff(1) clone 😅</sup>
 </div>
 <br />
-
+<!-- BADGES -->
+<div align="center">
+  <a href="https://github.com/shekohex/rsdiff">
+    <img src="https://github.com/shekohex/rsdiff/workflows/Tests/badge.svg"
+      alt="CI Tests" />
+  </a>
+   <a href="https://github.com/shekohex/rsdiff">
+    <img src="https://github.com/shekohex/rsdiff/workflows/Nightly%20lints/badge.svg"
+      alt="Lints" />
+  </a>
+  <a href="https://shadykhalifa.me/rsdiff">
+    <img src="https://img.shields.io/badge/docs-0.1.0-blue"
+      alt="Documentation" />
+  </a>
+</div>
 ## Safety
 
 This crate uses `#![deny(unsafe_code)]` to ensure everything is implemented in
