@@ -22,6 +22,7 @@
       alt="Documentation" />
   </a>
 </div>
+
 ## Safety
 
 This crate uses `#![deny(unsafe_code)]` to ensure everything is implemented in
