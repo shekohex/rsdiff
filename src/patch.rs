@@ -1,55 +1,83 @@
+//! Patching buffer using operations.
+//! this is not ready yet!
+//! it is a bit messy so never mind reading it.
+use log::trace;
+use std::mem;
 use std::str::Utf8Error;
 
-use crate::{Delta, Op, OpProps};
+use crate::delta::Operation;
 
 #[derive(Debug, Clone)]
-pub struct Patch<'a> {
+pub struct Patch<O: AsRef<[Operation]>> {
     buffer: Vec<u8>,
-    delta: Delta<'a>,
-    patch_ops: Vec<Op>,
+    ops: O,
 }
 
-impl<'a> Patch<'a> {
-    pub fn new(delta: Delta<'a>) -> Self {
+impl<O: AsRef<[Operation]>> Patch<O> {
+    pub fn new(ops: O) -> Self {
         Self {
             buffer: Vec::new(),
-            patch_ops: Vec::new(),
-            delta,
+            ops,
         }
     }
 
-    pub fn build(&mut self) {
-        let other_buffer = self.delta.buffer();
-        let ops = self
-            .delta
-            .operations()
-            .iter()
-            .filter(|op| op.is_overwrite());
-        for op in ops {
-            let props = op.props();
-            let patch_op = Op::overwrite(self.buffer.len(), props.target, props.len);
-            let start = op.source();
-            let end = op.len() + start;
-            self.buffer.extend(&other_buffer[start..end]);
-            self.patch_ops.push(patch_op);
+    pub fn apply(&mut self, original: impl AsRef<[u8]>) -> bool {
+        trace!("starting new patch with {} op", self.ops.as_ref().len());
+        // noting to patch
+        if self.ops.as_ref().is_empty() {
+            trace!("noting here to patch !");
+            return false;
         }
-        Delta::optimize_ops(&mut self.patch_ops);
-    }
-
-    pub fn apply(&self, original: &[u8]) -> Vec<u8> {
+        let mut original_buffer = original.as_ref().iter();
+        trace!("creating new empty buffer for the patched buffer");
         let mut patched = Vec::new();
-        let other_buffer = self.delta.buffer();
-        patched.resize(other_buffer.len(), 0);
-        let keeps = self.delta.operations().iter().filter(|op| op.is_keep());
-        for op in keeps {
-            Self::patch(&mut patched, original, op.props());
+        // seprate the operations.
+        let inserts = self.ops.as_ref().iter().filter(|op| op.is_insert());
+        let removes = self.ops.as_ref().iter().filter(|op| op.is_remove());
+        let mut idx = 0;
+        trace!("starting by the inserts ops first ..");
+        for op in inserts {
+            trace!("current idx: {}", idx);
+            trace!("Insert {}", op);
+            while idx < op.offset() {
+                if let Some(b) = original_buffer.next() {
+                    patched.push(*b);
+                    idx += 1;
+                } else {
+                    break;
+                }
+            }
+            let changes = op.buffer().unwrap();
+            patched.extend(changes);
+            idx += changes.len();
+        }
+        trace!("done with inserts ops ..");
+        patched.extend(original_buffer);
+        trace!("switching buffers (original <-> patched)");
+        let original_buffer = mem::replace(&mut patched, Vec::new());
+        let mut original_buffer = original_buffer.iter();
+        idx = 0;
+        trace!("starting removes ops ..");
+        for op in removes {
+            trace!("current idx: {}", idx);
+            trace!("Remove {}", op);
+            while idx < op.offset() {
+                if let Some(b) = original_buffer.next() {
+                    patched.push(*b);
+                    idx += 1;
+                } else {
+                    break;
+                }
+            }
+            trace!("skipping {} bytes..", op.len());
+            for _ in 0..op.len() {
+                original_buffer.next();
+            }
         }
 
-        for op in &self.patch_ops {
-            Self::patch(&mut patched, &self.buffer, op.props());
-        }
-
-        patched
+        patched.extend(original_buffer);
+        self.buffer = patched;
+        self.buffer.is_empty()
     }
 
     pub fn buffer(&self) -> &[u8] {
@@ -58,13 +86,5 @@ impl<'a> Patch<'a> {
 
     pub fn buffer_utf8(&self) -> Result<&str, Utf8Error> {
         std::str::from_utf8(&self.buffer)
-    }
-
-    fn patch(target: &mut [u8], soruce: &[u8], props: OpProps) {
-        let tb = props.target..props.target + props.len;
-        let sb = props.source..props.source + props.len;
-        let ss = &soruce[sb];
-        let ts = &mut target[tb];
-        ts.copy_from_slice(ss);
     }
 }

@@ -1,103 +1,57 @@
-use std::collections::HashMap;
+//! The [`Delta`] module.
+//!
+use std::fmt;
+use std::io;
+use std::mem;
 
 use blake2::{Blake2b, Digest};
+use log::trace;
 
-use crate::hash::{BlockHash, IndexedSignature, RollingHasher};
+use crate::hash::{CryptoHash, IndexedSignature, RollingHasher};
+use crate::window::Window;
 
-/// A Sliding window over the input buffer.
-#[derive(Debug, Copy, Clone)]
-struct Window {
-    start: usize,
-    end: usize,
+/// Operation to be done to upgrade from original version of the buffer to new version.
+#[derive(Clone, Eq, PartialEq)]
+pub enum Operation {
+    /// Insertation Operation to be performed by inserting the `buffer` at the `offset`.
+    Insert { buffer: Vec<u8>, offset: usize },
+    /// Removeal Operation to be performed by removing the `len` bytes from the `buffer` starting
+    /// at `offset` and going back.
+    Remove { offset: usize, len: usize },
 }
 
-impl Window {
-    const fn zero() -> Self {
-        Self::new(0, 0)
-    }
-    const fn new(start: usize, end: usize) -> Self {
-        Self { start, end }
-    }
-
-    const fn size(&self) -> usize {
-        self.end - self.start
-    }
-
-    fn shift(&mut self) {
-        self.start = self.end;
-    }
-}
-
-/// Holds the properties of the current [`Op`].
-#[derive(Debug, Copy, Clone)]
-pub struct OpProps {
-    /// The Offset in the Original Source.
-    pub source: usize,
-    /// The Offset in the Target Patch Source,
-    pub target: usize,
-    /// How many bytes needed to be copied over from the offset of the source to the offset of the
-    /// tartget.
-    pub len: usize,
-}
-
-impl OpProps {
-    fn merge(&mut self, other: &mut OpProps) {
-        self.target = other.target;
-        self.source = other.source;
-        self.len += other.len;
-        other.len = 0;
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum Op {
-    Keep(OpProps),
-    Overwrite(OpProps),
-}
-
-impl Op {
-    pub const fn keep(source: usize, target: usize, len: usize) -> Op {
-        Op::Keep(OpProps {
-            source,
-            target,
-            len,
-        })
-    }
-
-    pub const fn overwrite(source: usize, target: usize, len: usize) -> Op {
-        Op::Overwrite(OpProps {
-            source,
-            target,
-            len,
-        })
-    }
-
-    pub const fn is_keep(&self) -> bool {
-        matches!(self, Op::Keep(_))
-    }
-
-    pub const fn is_overwrite(&self) -> bool {
-        matches!(self, Op::Overwrite(_))
-    }
-
-    pub fn target(&self) -> usize {
-        match *self {
-            Op::Keep(prop) => prop.target,
-            Op::Overwrite(prop) => prop.target,
+/// Debug formtaing for easier debugging in tests.
+impl fmt::Debug for Operation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Operation::Insert { buffer, offset } => {
+                write!(f, "({}, {})", offset, String::from_utf8_lossy(buffer))
+            }
+            Operation::Remove { len, offset } => write!(f, "({}, {})", offset, len),
         }
     }
+}
 
-    pub fn source(&self) -> usize {
-        match *self {
-            Op::Keep(prop) => prop.source,
-            Op::Overwrite(prop) => prop.source,
+impl Operation {
+    pub fn is_insert(&self) -> bool {
+        matches!(self, Operation::Insert {..})
+    }
+
+    pub fn is_remove(&self) -> bool {
+        matches!(self, Operation::Remove {..})
+    }
+
+    pub fn offset(&self) -> usize {
+        match self {
+            Operation::Insert { offset, .. } => *offset,
+            Operation::Remove { offset, .. } => *offset,
         }
     }
 
     pub fn len(&self) -> usize {
-        match *self {
-            Op::Keep(prop) => prop.len,
-            Op::Overwrite(prop) => prop.len,
+        match self {
+            Operation::Insert { buffer, .. } => buffer.len(),
+            Operation::Remove { len, .. } => *len,
         }
     }
 
@@ -105,167 +59,235 @@ impl Op {
         self.len() == 0
     }
 
-    pub fn merge(&mut self, other: &mut Self) {
+    /// Current Operation buffer, returns [`None`] if the operation is [`Operation::Remove`].
+    pub fn buffer(&self) -> Option<&[u8]> {
         match self {
-            Op::Keep(prop) => prop.merge(other.props_mut()),
-            Op::Overwrite(prop) => prop.merge(other.props_mut()),
-        }
-    }
-
-    pub fn props(&self) -> OpProps {
-        match *self {
-            Op::Keep(prop) => prop,
-            Op::Overwrite(prop) => prop,
-        }
-    }
-
-    fn props_mut(&mut self) -> &mut OpProps {
-        match self {
-            Op::Keep(prop) => prop,
-            Op::Overwrite(prop) => prop,
+            Operation::Insert { buffer, .. } => Some(&buffer),
+            _ => None,
         }
     }
 }
 
+impl fmt::Display for Operation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Operation::Insert { offset, buffer } => write!(
+                f,
+                "+ {}..{} = {}",
+                offset,
+                offset + buffer.len(),
+                String::from_utf8_lossy(&buffer)
+            ),
+            Operation::Remove { offset, len } => write!(f, "- {}..-{}", offset, len),
+        }
+    }
+}
+
+/// Delta between two buffers, this dose not require the original buffer, but instead it only needs
+/// the original buffer signature, from there with the new modified buffer we can calculate the
+/// operations needed to upgrade the original to match the new modified one.
 #[derive(Debug, Clone)]
-pub struct Delta<'a> {
-    signature: IndexedSignature,
-    buffer: &'a [u8],
-    ops: Vec<Op>,
+pub struct Delta {
+    /// Indexed Singature is just like the [`crate::hash::Signature`] but can indexed by Block used to calculate
+    /// this signature and can be located using the `weak_hash` form [`crate::hash::RollingHasher`].
+    sig: IndexedSignature,
+    /// The [`Operation`]s calculated by calling [`Delta::diff`] on the new buffer.
+    ops: Vec<Operation>,
 }
 
-impl<'a> Delta<'a> {
-    pub fn new(signature: IndexedSignature, buffer: &'a [u8]) -> Self {
+impl Delta {
+    /// Create new [`Delta`].
+    /// ### Example
+    /// ```
+    /// use rsdiff::{Signature, Delta};
+    ///
+    /// let original = "Hello from the other side!";
+    /// // create a new signature with the original buffer.
+    /// let mut signature = Signature::new(original);
+    /// // calculate the signature
+    /// signature.calculate();
+    /// let new = "Hello from this side!";
+    /// let mut delta = Delta::new(signature.to_indexed());
+    /// // then you can calculate the delta by calling
+    /// delta.diff(new);
+    ///
+    /// ```
+    pub const fn new(signature: IndexedSignature) -> Self {
         Self {
-            signature,
-            buffer,
+            sig: signature,
             ops: Vec::new(),
         }
     }
-
-    pub fn buffer(&self) -> &[u8] {
-        self.buffer
-    }
-
-    pub fn calculate(&mut self) {
-        let block_size = self.signature.block_size;
-        let blocks = &self.signature.blocks;
-        let buf = self.buffer;
-        let mut base_map = HashMap::new();
-        let mut hasher = RollingHasher::new();
-        let mut window = Window::zero();
-        let hashes_len = (buf.len() + block_size - 1) / block_size;
-        let mut hashes = Vec::with_capacity(hashes_len);
-        hashes.reserve(hashes_len);
-        loop {
-            let remaining = buf.len() - window.start;
-            if remaining == 0 {
-                break;
-            }
-            let current_window_size = std::cmp::min(remaining, block_size);
-            while hasher.count() < current_window_size {
-                hasher.insert(buf[window.end]);
-                window.end += 1;
-            }
-            match self.find(&window, hasher.digest()) {
-                Some(block) => {
-                    window.shift();
-                    hasher.reset();
-                    base_map.insert(block.crypto_hash, block.offset);
-                    hashes.push(block.crypto_hash);
-                }
-                None => {
-                    hasher.remove(buf[window.start]);
-                    window.start += 1;
-                }
-            }
-        }
-
-        if hashes.len() == blocks.len() {
-            let mut matched = true;
-            for e in hashes.iter().zip(blocks.values()) {
-                if *e.0 != e.1.crypto_hash {
-                    matched = false;
-                    break;
-                }
-            }
-
-            if matched {
-                // no changes
-                return;
-            }
-        }
-
-        for block in blocks.values() {
-            match base_map.get(&block.crypto_hash) {
-                Some(offset) => {
-                    self.ops.push(Op::keep(*offset, block.offset, block.size));
-                }
-                None => {
-                    self.ops
-                        .push(Op::overwrite(block.offset, block.offset, block.size));
-                }
-            }
-        }
-        self.optimize();
-    }
-
-    pub fn operations(&self) -> &[Op] {
+    /// Get the operations calculated so far.
+    ///
+    /// see [`Delta::into_operations`] if you don't need the [`Delta`] anymore.
+    pub fn operations(&self) -> &[Operation] {
         &self.ops
     }
 
-    fn find(&self, window: &Window, weak_hash: u32) -> Option<BlockHash> {
-        let blocks = &self.signature.blocks;
-        if let Some(block) = blocks.get(&weak_hash) {
-            let slice = &self.buffer[window.start..window.end];
-            let mut blake2 = Blake2b::new();
-            blake2.update(slice);
-            let blake2_hash = blake2.finalize();
-            if blake2_hash[..32] == *block.crypto_hash {
-                let block = BlockHash {
-                    offset: window.start,
-                    size: window.size(),
-                    crypto_hash: block.crypto_hash,
-                    weak_hash,
-                };
-                Some(block)
-            } else {
-                None
-            }
-        } else {
-            None
-        }
+    /// Consume `Self` and returns the operations to be then used for patching.
+    ///
+    /// see [`Delta::operations`] if you don't want to consume the `Self`.
+    pub fn into_operations(self) -> Vec<Operation> {
+        self.ops
     }
 
-    pub(crate) fn optimize(&mut self) {
-        let mut overwrites = self
-            .ops
-            .iter()
-            .filter(|op| op.is_overwrite())
-            .cloned()
-            .collect();
-        let mut keeps = self.ops.iter().filter(|op| op.is_keep()).cloned().collect();
-        Self::optimize_ops(&mut overwrites);
-        Self::optimize_ops(&mut keeps);
-        self.ops.clear();
-        self.ops.extend(keeps);
-        self.ops.extend(overwrites);
-    }
-
-    pub(crate) fn optimize_ops(ops: &mut Vec<Op>) {
-        if !ops.is_empty() {
-            ops.sort_by_key(|op| op.target());
-            let (mut prev, tail) = ops.split_first_mut().unwrap();
-            for n in tail.iter_mut() {
-                if prev.source() + prev.len() == n.source()
-                    && prev.target() + prev.len() == n.target()
-                    && prev.len() + n.len() < usize::MAX
-                {
-                    n.merge(prev);
+    /// Calculate the diff between the original and modified buffers.
+    ///
+    /// Retuns Err in case if there is any IO operation failled.
+    pub fn diff(&mut self, buf: impl AsRef<[u8]>) -> io::Result<()> {
+        trace!("starting new diff");
+        let block_size = self.sig.block_size;
+        trace!("block_size = {}", block_size);
+        let original_buf_len = self.sig.original_buffer_len;
+        trace!("original_buf_len = {}", original_buf_len);
+        let mut window = Window::new(buf, block_size)?;
+        let mut hasher = RollingHasher::new();
+        let mut ins_buffer = Vec::new();
+        let mut last_matching_block_idx = -1;
+        trace!("last_matching_block_idx = {}", last_matching_block_idx);
+        hasher.update(window.frame().0);
+        trace!("start diff loop..");
+        while window.has_frame() {
+            let block_idx = self.find_match(hasher.digest(), &window, last_matching_block_idx);
+            trace!("block_idx = {:?}", block_idx);
+            trace!("current total bytes read: {}", window.bytes_read());
+            if let Some(block_idx) = block_idx {
+                if !ins_buffer.is_empty() {
+                    trace!(
+                        "insert buffer is not empty, add insert op with len: {}",
+                        ins_buffer.len()
+                    );
+                    self.add_insert_op(
+                        window.bytes_read() - ins_buffer.len(),
+                        mem::replace(&mut ins_buffer, Vec::new()),
+                    );
                 }
-                prev = n;
+                trace!("check if the current block id is greater than last matched one");
+                if block_idx as isize > last_matching_block_idx + 1 {
+                    trace!("okay, it is greater, add a remove op");
+                    let block_len = block_idx as isize - last_matching_block_idx - 1;
+                    let len = block_size as isize * block_len;
+                    self.add_remove_op(window.bytes_read(), len as usize);
+                }
+                trace!(
+                    "update last matched block id ({}) with the current matched block id ({})",
+                    last_matching_block_idx,
+                    block_idx
+                );
+                last_matching_block_idx = block_idx as isize;
+                trace!("move a block forword with block_size = {}", block_size);
+                for _ in 0..block_size {
+                    trace!("current total bytes read: {}", window.bytes_read());
+                    if window.on_boundry() && window.frame_size() == 0 {
+                        trace!("we hit the bounds and current frame size is zero; break");
+                        break;
+                    }
+                    trace!("move the window one byte forword ..");
+                    let (tail, head) = window.move_forword()?;
+                    if let Some(tail) = tail {
+                        trace!("rolling out the hash ..");
+                        hasher.remove(tail);
+                    }
+
+                    if let Some(head) = head {
+                        trace!("rolling in the hash ..");
+                        hasher.insert(head);
+                    }
+                }
+                trace!(
+                    "moved a block, current total bytes read so far: {}",
+                    window.bytes_read()
+                );
+            } else {
+                trace!("no match found, moving the window forword one byte ..");
+                let (tail, head) = window.move_forword()?;
+                trace!("current total bytes read: {}", window.bytes_read());
+                if let Some(tail) = tail {
+                    trace!("rolling out the hash ..");
+                    hasher.remove(tail);
+                    trace!("add the current tail to the insert buffer ..");
+                    ins_buffer.push(tail);
+                }
+                if let Some(head) = head {
+                    trace!("rolling in the hash ..");
+                    hasher.insert(head);
+                }
             }
-            ops.retain(|op| !op.is_empty());
+        }
+
+        trace!("diff loop ended.");
+        trace!("current total bytes read: {}", window.bytes_read());
+        trace!(
+            "check the insert buffer for any remaining bytes, len = {}",
+            ins_buffer.len()
+        );
+        if !ins_buffer.is_empty() {
+            self.add_insert_op(window.bytes_read() - ins_buffer.len(), ins_buffer);
+        }
+
+        let original_block_count = (original_buf_len + block_size - 1) / block_size;
+        trace!("checking if the last matched block is less than the original block count which means a remove op should be added!");
+        trace!("original block count = {}", original_block_count);
+        trace!("last matching block = {}", last_matching_block_idx + 1);
+        if last_matching_block_idx + 1 < original_block_count as isize {
+            let block_len = (last_matching_block_idx + 1) * block_size as isize;
+            let len = original_buf_len as isize - block_len;
+            self.add_remove_op(window.bytes_read(), len as usize);
+        }
+        Ok(())
+    }
+
+    fn add_insert_op(&mut self, offset: usize, buffer: Vec<u8>) {
+        trace!(
+            "Insert: at {} with len {} and buf = {} {:?}",
+            offset,
+            buffer.len(),
+            String::from_utf8_lossy(&buffer),
+            buffer
+        );
+        self.ops.push(Operation::Insert { offset, buffer });
+    }
+
+    fn add_remove_op(&mut self, offset: usize, len: usize) {
+        trace!("Remove: at {} with len {}", offset, len,);
+        self.ops.push(Operation::Remove { offset, len });
+    }
+
+    /// Try to find a matched block from the original buffer signature.
+    /// if so, it will try to find if the current block index is the same as the one we matched.
+    /// if so, it is not modified, but if it fails these condations, it means there is a
+    /// modification happened in this block.
+    fn find_match<B: AsRef<[u8]>>(
+        &self,
+        weak_hash: u32,
+        window: &Window<B>,
+        last_matching_block_idx: isize,
+    ) -> Option<usize> {
+        trace!("weak_hash of the current frame = 0x{:0x}", weak_hash);
+        match self.sig.blocks.get(&weak_hash) {
+            Some((idx, block)) => {
+                trace!("found a match with the weak hash !!!");
+                let mut blake2 = Blake2b::new();
+                let (front, back) = window.frame();
+                blake2.update(front);
+                blake2.update(back);
+                let result = blake2.finalize();
+                let crypto_hash = CryptoHash::new(&result[..32]);
+                trace!("comparing the crypto hash");
+                let crypto_match = block.crypto_hash == crypto_hash;
+                let new_idx = *idx as isize > last_matching_block_idx;
+                trace!("crypto_match ? {}", crypto_match);
+                trace!("new_idx ? {}", new_idx);
+                if crypto_match && new_idx {
+                    trace!("all matched !!!");
+                    Some(*idx)
+                } else {
+                    trace!("crypto hash did not match, skip ..");
+                    None
+                }
+            }
+            None => None,
         }
     }
 }
